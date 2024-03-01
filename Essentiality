@@ -1,0 +1,261 @@
+#####
+# Test of Essentiality
+# Return value is table identifying essential genes using a Monte Carlo simulation-based approach for mariner transposons that insert at TA-sites
+# This script was inspired by the codes from the Whitley Lab (https://github.com/WhiteleyLab/Tn-seq/blob/master/TnSeqDESeq2Essential_mariner.R)
+# Date: June 7, 2023
+# Author: Thais Harder de Palma
+#####
+
+#####
+# Preamble
+# Set WD with location of data
+setwd("G:/My Drive/URI/phd/paper_essential_genome/final_analysis/atcc/cc_ana")
+
+# load packages
+library(tidyverse)
+library(DESeq2)
+
+### Set up output file (txt)
+
+# Parameters
+filenames = dir(pattern = "trimmed-sites.txt", path = './insertion_sites') # Find file names
+conditions = sub("-sites.txt", "", filenames) # Extract file names core
+gff_pfx = "ATCC" # Genome
+
+#set the name of your condition
+test_pfx = gff_pfx
+#set the number of replicates you have
+test_reps = 3
+#set the number of pseudodatasets to generate
+num_expected = 100
+#set the output file prefix
+out_pfx = paste(test_pfx, "Essential_100", sep = "_")
+#set the number of sites with the most reads to "trim" (remove) from the data
+to_trim = 50
+#can put the "conditions" here, see variable above, the order does not matter
+in_files = conditions
+# set path for output folder
+path = './output/'
+
+# Initialize output file
+write(out_pfx, file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep="")) # this creates a txt file, with the info from the next lines of code that start with "write"
+write(paste( "\n", "input files:", sep=""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(in_files, file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste( "\n", "gff: ", gff_pfx, sep=""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste( "\n", "number of replicates: ", test_reps, sep=""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("\n", "to trim: ", to_trim, sep=""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("number of expected datasets: ", num_expected, sep=""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+
+### Load sites files
+sites = data.frame(Pos=c(0)) 
+for (i in 1:length(in_files)) {
+  newsites = read.table(paste(paste('./insertion_sites/',in_files[i], sep="/"), "sites.txt", sep="-")) 
+  colnames(newsites) = c(paste("V", i, sep=""), "Pos")
+  newsites = tail(newsites, n=-to_trim) 
+  newsites = arrange(newsites,Pos)
+  sites = merge(sites, newsites, all=T) 
+}
+sites = tail(sites, n=-1) # Delete position 0
+sites[is.na(sites)] = 0 # Fill NA with 0
+
+write.csv(sites, file=paste(path, paste(out_pfx, ".sites.csv", sep=""), sep=""), row.names=F)
+
+#####
+# Prepare data
+
+# LOESS smooth data - corrects for how multifork replication can inflate the abundance of insertions close to the origin of replication (see Narayanan et al. 2017, p.12).
+for (i in 2:(length(sites))) { 
+  counts.loess <- loess(sites[[i]] ~ sites$Pos, span=1, data.frame(x=sites$Pos, y=sites[[i]]), control=loess.control(statistics=c("approximate"),trace.hat=c("approximate")))
+  counts.predict <- predict(counts.loess, data.frame(x=sites$Pos))
+  counts.ratio <- counts.predict/median(counts.predict)
+  sites[[i]] <- sites[[i]]/counts.ratio
+}
+
+# output number of total and shared sites across samples. Need to edit based on number of samples.
+sites_total = sites %>% mutate(numreps = (V1 > 0) + (V2 > 0) + (V3 > 0)) %>% filter(numreps >= 1)
+write(paste("number of sites:", nrow(sites_total)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+sites_shared = sites %>% mutate(numreps = (V1 > 0) + (V2 > 0) + (V3 > 0)) %>% filter(numreps >= 2)
+write(paste("number of sites shared by at least 2 samples:", nrow(sites_shared)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+sites_all = sites %>% mutate(numreps = (V1 > 0) + (V2 > 0) + (V3 > 0)) %>% filter(numreps >= 3)
+write(paste("number of sites in all three samples:", nrow(sites_all)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+
+# Normalize data by reads/site
+colData = data.frame(c(rep(test_pfx, test_reps)), condition = rep("untreated", test_reps))
+sitescds = sites[,2:length(sites)] %>% round %>% DESeqDataSetFromMatrix(colData = colData, design= ~ 1)
+sitescds = estimateSizeFactors(sitescds)
+
+#Output the normalized counts
+counts.norm = counts(sitescds, normalized=F) 
+rownames(counts.norm) = sites$Pos
+
+# Initialize the list of genes, determine genome length
+#can add column names if your gff has extra columns
+gff = read.delim(file= 'G:/My Drive/URI/phd/paper_essential_genome/final_analysis/atcc/hpara.gff', sep="\t", fill=TRUE, header=F, col.names = c("seqname", "source", "feature", "start", "end", "score", "strand", "frame", "att")) 
+print(head(gff))
+gff = tail(gff, n=-1) # after n, put - the number of rows with header 
+gff = gff[(gff$feature=="CDS"),] # Keep only observations of CDS
+gff = gff %>% mutate(range = end - start,
+                     end = round(end - range*0.1, 0),
+                     start = round(start + range*0.1, 0)) %>% select(-range) # Removes 10% of each side of the gene
+print(head(gff))
+
+# Initialize read counts per gene and number of independent Tn sites per gene
+# Generate pseudo-datasets with the same number of insertion sites and total reads mapping to those sites, randomly distributed across the genome at TA sites
+print("Generating pseudo-datasets")
+counts.df = data.frame(counts.norm)
+counts.df$Pos = as.numeric(rownames(counts.df))
+counts.df = arrange(counts.df, Pos)
+numreads = sum(counts.norm)/test_reps
+numsites = length(which(counts.norm>0))/test_reps
+#generates a new sites data frame and calculates the mean counts for each site in a new column. This column (containing the mean) is then used to sample from to generate the expected datasets.
+sites2 = sites[2:(test_reps+1)]
+sites2$mean =rowMeans(sites2) %>% round
+Possible_sites = read.csv("G:/My Drive/URI/phd/paper_essential_genome/final_analysis/atcc/hpara_wo_plasmid_TAsites.csv") #possible TA insertion sites for mariner transposon
+
+counts.df2 = Possible_sites 
+colnames(counts.df2) = 'Pos'
+counts.df2 = left_join(counts.df2, counts.df)
+#compute expected dataset
+for (i in 1:num_expected) {
+  print(i)
+  expected = data.frame(Pos=sample(Possible_sites$sites, round(numsites,0), replace = T), Exp=sample(sites2$mean, round(numsites,0), replace = F)) %>% arrange(Pos) %>% group_by(Pos) %>% mutate(obs = row_number()) %>% filter(obs < 2) %>% ungroup() %>% select(-obs) #may need to change column name depending on sites file
+  colnames(expected)[2] = paste("Expected", i, sep=".")
+  counts.df2 = left_join(counts.df2, expected) %>% arrange(Pos)
+  counts.df2[is.na(counts.df2)] = 0
+}
+rownames(counts.df2) = counts.df2$Pos # check
+counts.norm = as.matrix(counts.df2[,(1:(length(counts.df2)-1))])
+
+write(paste("\n", "numreads: ", numreads, sep=""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("numsites: ", numsites, sep=""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+
+# Initialize the lists of read counts per gene and number of independent Tn sites per gene
+controlreps = 0
+expreps = 0
+for (c in 1:length(counts.norm[1,])) {
+  gff[,c+9] = rep(1,length(gff[,1]))
+  if (controlreps < test_reps) {
+    controlreps = controlreps + 1
+    colnames(gff)[c+9] = paste(test_pfx, controlreps, sep=".")
+  }
+  else {
+    expreps = expreps + 1
+    colnames(gff)[c+9] = paste("Expected", expreps, sep=".")
+  }
+}
+
+# Output gene boundaries and read counts per Tn site for Perl binning script
+print("Binning read counts by gene boundaries")
+boundariesfile = paste(path, paste(out_pfx, ".boundaries.tsv", sep=""), sep="")
+sitecountsfile = paste(path, paste(out_pfx, ".sitecounts.tsv", sep=""), sep="")
+write.table(gff[,c(4,5, 10:length(gff))], boundariesfile, quote=FALSE, sep="\t", row.names=F)
+write.table(counts.df, sitecountsfile, quote=FALSE, sep="\t", row.names=F)
+
+# Bin sites into genes
+key = gff[,c(4,5)]
+
+numsites = NA
+genecounts = NA
+
+for (i in 1:nrow(key)) {
+  tocount = counts.df2 %>% filter(Pos >= key$start[i] & Pos <= key$end[i])
+  counts = tocount %>% summarise(across(-Pos, sum)) %>% mutate(across(everything(), ~ifelse(.x == 0, 1, .x)))
+  site = tocount %>% mutate(across(-Pos, ~ifelse(.x > 0, 1, 0))) %>% summarise(across(-Pos, sum)) 
+  genecounts = rbind(genecounts, counts)
+  numsites = rbind(numsites, site)
+}
+
+genecounts = genecounts[-1,]
+numsites = numsites[-1,]
+genecounts2 = cbind(key, genecounts)
+
+genes = data.frame(id = rep("", length(gff[,1]), stringsAsFactors = FALSE))
+genes$id = as.character(genes$id)
+for (i in 1:length(gff[,1])) {
+  genes$id[i] = strsplit(grep("ID",strsplit(as.character(gff$att[i]),";")[[1]], value=T),"=")[[1]][2]
+  genes$name[i] = strsplit(grep("Name",strsplit(as.character(gff$att[i]),";")[[1]], value=T),"=")[[1]][2]
+}
+
+write.table(genecounts2, paste(path, paste(out_pfx, ".genecounts2.tsv", sep=""), sep=""), quote=FALSE, sep="\t", row.names=FALSE) # COmmented for now because too large
+
+# Perform differential fitness analysis
+colnames(numsites) = colnames(gff)[10:length(gff)] #change this number based on number of columns in gff
+numsitesout = data.frame(numsites[,(1:test_reps)])
+numsitesout[,test_reps+1] = rowMeans(numsites[,-(1:test_reps)])
+colnames(numsitesout)[test_reps+1] = "Expected_numsites"
+colData = data.frame(c(rep(test_pfx, test_reps), rep("Expected", num_expected)), condition = c(rep(test_pfx, test_reps),rep("Expected", num_expected)))
+numcountsout = data.frame(genecounts2[,1:(test_reps+2)])
+numcountsout[,test_reps+3] = rowMeans(genecounts2[,-(1:(test_reps+2))])
+colnames(numcountsout)[test_reps+3] = "Expected_numreads"
+
+############################
+
+#betaPrior=TRUE
+#When betaPrior=TRUE in DESeq2 step "nbinomWaldTest," log2fold changes ARE shrunk towards zero when counts are low, dispersion is high, or degrees of freedom is low.
+#We consider betaPrior=TRUE as the more conservative analysis. It is less likely to identify genes with a large l2fc simply because the data is noisy
+#betaPrior=TRUE is also the legacy DESeq2 option prior to version 1.16 (November 2016)
+genescds_T = DESeqDataSetFromMatrix(countData = round(genecounts), colData = colData[1:(num_expected + 3),], design = ~ condition)
+genescds_T = DESeq(genescds_T)
+res_T = lfcShrink(genescds_T, coef = paste0('condition_Expected_vs_', gff_pfx))
+print(head(res_T)) 
+out_T = cbind(res_T, genes$id, genes$name, numcountsout, numsitesout)
+colnames(out_T)[2] = "log2FoldChange_TRUE"
+colnames(out_T)[3] = "lfcSE_TRUE"
+colnames(out_T)[4] = "pvalue_TRUE"
+colnames(out_T)[5] = "padj_TRUE"
+colnames(out_T)[6] = "id"
+colnames(out_T)[7] = 'name'
+
+#Count number of significant genes; can adjust pvalue and padj here based on output(s) that you are interested in
+write(paste("\n", "Analyses with betaPrior = TRUE (l2fc shrinkage):", sep=""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste(paste("\n", "number of genes with pvalue <= 0.01 in TRUE:", sep=""), sum(res_T$pvalue<=.01, na.rm=TRUE)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("number of genes with padj <= 0.01 in TRUE:", sum(res_T$padj<=.01, na.rm=TRUE)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+
+# Perform bimodal clustering and essentiality calling and output results
+library(mclust)
+fit_T = Mclust(out_T$log2FoldChange_TRUE, G=1:2, modelNames = "E") #Assume variable variance of clusters
+write.csv(fit_T$z, file = './z_values_absolute.csv')
+summary(fit_T, parameters = TRUE)
+category_T = rep("",length(out_T$id))
+for (i in 1:length(out_T$id)) {
+  if (fit_T$classification[i] == 2 & out_T$log2FoldChange_TRUE[i] > 0) {
+    category_T[i] = "Reduced"
+  }
+  else {
+    category_T[i] = "Unchanged"
+  }
+}
+
+density_T = densityMclust(out_T$log2FoldChange_TRUE, G=1:2, modelNames = "E") #Assume variable variance of clusters
+summary(density_T)
+pdf(paste(path, paste(out_pfx, "TRUE_histogram.pdf", sep="_"), sep=""), width = 10, height = 4)
+par(mfrow = c(1,2))
+plot(density_T, what = "density", data = out_T$log2FoldChange_TRUE, breaks=100)
+plot(fit_T, what = "uncertainty")
+dev.off()
+
+#Count number of unchanged and reduced genes, l2fc means, and l2fc variances
+write(paste(paste("\n", "Mclust Unchanged TRUE:", sep=""), sum(category_T=="Unchanged")), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("Mclust Reduced TRUE:", sum(category_T=="Reduced")), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste(paste("\n","Mclust_reduced_mean_TRUE: ", sep=""), fit_T$parameters$mean[1], sep =""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("Mclust_unchanged_mean_TRUE: ", fit_T$parameters$mean[2], sep =""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste(paste("\n", "Mclust_reduced_variance_TRUE: ", sep=""), fit_T$parameters$variance$sigmasq[1], sep =""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("Mclust_unchanged_variance_TRUE: ", fit_T$parameters$variance$sigmasq[2], sep =""), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+
+fit_T$uncertainty[which(out_T$log2FoldChange_TRUE < 0)] = 0
+print(head(category_T, 10))
+essentiality_T = as.data.frame(cbind(category_T, fit_T$uncertainty))
+colnames(essentiality_T) = c("Essentiality_TRUE", "Uncertainty_TRUE")
+out_T = cbind(out_T, essentiality_T) 
+out_T = out_T %>% as.data.frame()
+out_T = out_T %>% mutate(log2FoldChange_TRUE = log2FoldChange_TRUE * -1,
+                         Uncertainty_TRUE = as.numeric(Uncertainty_TRUE))
+
+#Count number of significant genes with reduced Mclust; can adjust padj (or pvalue) and uncertaintly values here based on output(s) that you are interested in
+write(paste("\n", "Reduced and Uncertainty <=0.01 if TRUE:", sum(out_T$Essentiality_TRUE=="Reduced" & as.numeric(as.character(out_T$Uncertainty_TRUE))<=0.01)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("Reduced and Uncertainty <=0.01 and padj <=0.01 if TRUE:", sum(out_T$Essentiality_TRUE=="Reduced" & out_T$padj_TRUE<=.01 & as.numeric(as.character(out_T$Uncertainty_TRUE))<=0.01, na.rm=TRUE)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("\n", "Reduced and Uncertainty <=0.05 if TRUE:", sum(out_T$Essentiality_TRUE=="Reduced" & as.numeric(as.character(out_T$Uncertainty_TRUE))<=0.05)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+write(paste("Reduced and Uncertainty <=0.05 and padj <=0.05 if TRUE:", sum(out_T$Essentiality_TRUE=="Reduced" & out_T$padj_TRUE<=.05 & as.numeric(as.character(out_T$Uncertainty_TRUE))<=0.05, na.rm=TRUE)), file = paste(path, paste(out_pfx, "_stats.txt", sep=""), sep=""), append = TRUE)
+
+write.csv(out_T, file=paste(path, paste(out_pfx, ".TRUE.DESeq.csv", sep=""), sep=""), row.names=F)
+
