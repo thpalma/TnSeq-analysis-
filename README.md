@@ -17,3 +17,18 @@ The script "Essentiality.R" returns a table identifying essential genes using a 
 
 Date: June 7, 2023
 Author: Thais Harder de Palma - University of Rhode Island, M. Ramsey lab.
+
+# Anvio pangenome analysis
+
+The Snakefile in this directory dictates running the anvio pangenome pipeline with standard settings.
+Prior to the Anvi'o pipeline, steps are taken to download Haemophilus parainfluenzae genomes and 
+organize them for analysis.
+
+This Snakemake workflow follows the workflow seen here:
+https://merenlab.org/2016/11/08/pangenomics-v2/
+
+EL1.fa contains the genome for the EL1 strain
+hpara.fa contains the fenome for the atcc strain
+atcc_core.txt contains sequence names for the core genome of the atcc strain
+EL1_core.txt contains sequence names for the core genome of the EL1 strain
+
