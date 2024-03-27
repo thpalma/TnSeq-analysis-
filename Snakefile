@@ -1,3 +1,6 @@
+# Authors: Christopher Powers and Thais Harder de Palma
+# Institution: The University of Rhode Island
+
 rule all:
     input:
         "anvi.genomes"
