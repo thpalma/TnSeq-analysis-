@@ -25,10 +25,14 @@ Prior to the Anvi'o pipeline, steps are taken to download Haemophilus parainflue
 organize them for analysis.
 
 This Snakemake workflow follows the workflow seen here:
+
 https://merenlab.org/2016/11/08/pangenomics-v2/
 
 EL1.fa contains the genome for the EL1 strain
+
 hpara.fa contains the fenome for the atcc strain
+
 atcc_core.txt contains sequence names for the core genome of the atcc strain
+
 EL1_core.txt contains sequence names for the core genome of the EL1 strain
 
